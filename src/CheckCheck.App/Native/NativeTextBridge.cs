@@ -41,7 +41,9 @@ public sealed class NativeTextBridge : IDisposable
     private const int WmHotkey = 0x0312;
     private readonly Dispatcher _dispatcher;
     private HwndSource? _source;
-    private Action? _callback;
+    private Func<Task>? _callback;
+    private uint _hotkeyModifiers, _hotkeyKey = 0x20;
+    private bool _hotkeyDispatching;
     private nint _pendingTarget;
     private bool _disposed;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
@@ -49,20 +51,40 @@ public sealed class NativeTextBridge : IDisposable
     public NativeTextBridge() => _dispatcher = System.Windows.Application.Current?.Dispatcher
         ?? Dispatcher.CurrentDispatcher;
 
+    public bool SuspendHotkeyCallbacks { get; set; }
+    public event Action<Exception>? HotkeyFailed;
+
     public void RegisterHotKey(Window window, Action callback, uint modifiers = 3, uint key = 0x20)
+        => RegisterHotKeyAsync(window, () => { callback(); return Task.CompletedTask; }, modifiers, key);
+
+    public void RegisterHotKeyAsync(Window window, Func<Task> callback, uint modifiers = 3, uint key = 0x20)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(callback);
+        if (modifiers is 0 or > 15 || key is 0 or > 254 or 0x10 or 0x11 or 0x12 or 0x5B or 0x5C)
+            throw new InvalidOperationException("Ctrl·Alt·Shift·Win 중 하나와 일반 키를 함께 선택해 주세요.");
         var handle = new WindowInteropHelper(window).EnsureHandle();
         var source = HwndSource.FromHwnd(handle)
             ?? throw new InvalidOperationException("앱 창을 찾을 수 없어요.");
+        if (_source?.Handle == handle && modifiers == _hotkeyModifiers && key == _hotkeyKey)
+        {
+            _callback = callback;
+            return;
+        }
         // Register a replacement first so a conflict never loses the existing shortcut.
         int nextId = _source is null ? HotkeyId : _activeHotkeyId == HotkeyId ? HotkeyId + 1 : HotkeyId;
         if (!Native.RegisterHotKey(handle, nextId, 0x4000 | modifiers, key))
             throw new InvalidOperationException("이 단축키를 다른 앱이 사용 중이에요. 다른 조합을 선택해 주세요.");
         if (_source is not null) Native.UnregisterHotKey(_source.Handle, _activeHotkeyId);
-        else source.AddHook(WindowMessage);
+        if (_source != source)
+        {
+            _source?.RemoveHook(WindowMessage);
+            source.AddHook(WindowMessage);
+        }
         _activeHotkeyId = nextId;
         _callback = callback;
+        _hotkeyModifiers = modifiers;
+        _hotkeyKey = key;
         _source = source;
     }
 
@@ -70,10 +92,22 @@ public sealed class NativeTextBridge : IDisposable
     {
         if (message == WmHotkey && wParam.ToInt32() == _activeHotkeyId)
         {
-            _pendingTarget = Native.GetForegroundWindow();
             handled = true;
-            // The caller must capture before activating the review window.
-            _callback?.Invoke();
+            if (_disposed || SuspendHotkeyCallbacks || _hotkeyDispatching) return 0;
+            _pendingTarget = Native.GetForegroundWindow();
+            _hotkeyDispatching = true;
+            // Return from WM_HOTKEY before any await, UIA or WPF activation. Running an
+            // async-void callback inside the native hook can re-enter its message loop.
+            _dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(async () =>
+            {
+                try
+                {
+                    if (!_disposed && !SuspendHotkeyCallbacks && _callback is { } callback)
+                        await callback();
+                }
+                catch (Exception ex) { HotkeyFailed?.Invoke(ex); }
+                finally { _pendingTarget = 0; _hotkeyDispatching = false; }
+            }));
         }
         return 0;
     }
@@ -83,13 +117,40 @@ public sealed class NativeTextBridge : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         var target = Interlocked.Exchange(ref _pendingTarget, 0);
         if (target == 0) target = Native.GetForegroundWindow();
+        return await CaptureTargetAsync(target, selectedOnly: false, restoreTarget: false);
+    }
+
+    /// <summary>Call only in response to the user clicking the selection popup.</summary>
+    public Task<CaptureSnapshot?> CaptureFromWindowAsync(nint target, bool selectedOnly = true)
+        => CaptureTargetAsync(target, selectedOnly, restoreTarget: true);
+
+    private async Task<CaptureSnapshot?> CaptureTargetAsync(nint target, bool selectedOnly, bool restoreTarget)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (!await _operationGate.WaitAsync(0))
             throw new InvalidOperationException("이전 가져오기 작업이 끝난 뒤 다시 눌러 주세요.");
         try
         {
-            await WaitForModifiersAsync();
-            var attempt = await Task.Run(() => CaptureCore(target)).WaitAsync(TimeSpan.FromSeconds(4));
+            await WaitForModifiersAsync(_hotkeyKey);
+            if (restoreTarget)
+            {
+                Native.GetWindowThreadProcessId(target, out var pid);
+                if (target == 0 || !Native.IsWindow(target) || pid == Environment.ProcessId)
+                    throw new InvalidOperationException("글을 선택했던 창이 닫혔어요. 원래 앱에서 다시 선택해 주세요.");
+                if (Native.GetForegroundWindow() != target && !Native.SetForegroundWindow(target))
+                    throw new InvalidOperationException("원래 앱을 앞으로 가져오지 못했어요. 원래 앱에서 단축키를 눌러 주세요.");
+                await Task.Delay(100);
+                EnsureExternalWindow(target);
+                if (Native.HasOpenMenu(target))
+                {
+                    Native.DismissMenu();
+                    await Task.Delay(100);
+                    EnsureExternalWindow(target);
+                }
+            }
+            var attempt = await Task.Run(() => CaptureCore(target, selectedOnly)).WaitAsync(TimeSpan.FromSeconds(4));
             if (attempt.Snapshot is not null) return attempt.Snapshot;
+            if (attempt.NoSelection) return null;
             return await CaptureWithCopyAsync(attempt);
         }
         catch (ElementNotAvailableException)
@@ -99,6 +160,10 @@ public sealed class NativeTextBridge : IDisposable
         catch (TimeoutException)
         {
             throw new InvalidOperationException("원래 앱의 응답이 늦어요. 직접 복사해서 붙여넣어 주세요.");
+        }
+        catch (COMException)
+        {
+            throw new InvalidOperationException("원래 앱에서 선택한 글을 읽지 못했어요. 글을 다시 선택하거나 직접 복사해서 붙여넣어 주세요.");
         }
         finally { _operationGate.Release(); }
     }
@@ -115,11 +180,14 @@ public sealed class NativeTextBridge : IDisposable
     private static CaptureAttempt CaptureCore(nint window, bool selectedOnly = false)
     {
         EnsureExternalWindow(window);
+        var focusedHandle = FocusedHandle(window);
+        if (focusedHandle != 0 && string.Equals(Native.ClassName(focusedHandle), "Edit", StringComparison.OrdinalIgnoreCase) &&
+            (Native.GetWindowLongPtr(focusedHandle, -16).ToInt64() & 0x20) != 0)
+            throw new InvalidOperationException("비밀번호 입력칸은 가져오지 않아요.");
         var element = AutomationElement.FocusedElement
             ?? throw new InvalidOperationException("입력 위치를 찾지 못했어요. 글을 선택해 복사한 뒤 직접 붙여넣어 주세요.");
         ValidateElement(window, element);
         var displayName = WindowName(window);
-        var focusedHandle = FocusedHandle(window);
 
         // Standard EDIT has an exact UTF-16 range and an undo-aware replacement API.
         if (focusedHandle != 0 && string.Equals(Native.ClassName(focusedHandle), "Edit", StringComparison.OrdinalIgnoreCase))
@@ -131,7 +199,7 @@ public sealed class NativeTextBridge : IDisposable
             if (start < 0 || end < start || end > original.Length)
                 throw new InvalidOperationException("선택 영역을 정확히 확인하지 못했어요. 직접 붙여넣어 주세요.");
             var hasSelection = end > start;
-            if (selectedOnly && !hasSelection) return new(window, element.GetRuntimeId(), displayName, null);
+            if (selectedOnly && !hasSelection) return new(window, element.GetRuntimeId(), displayName, null, NoSelection: true);
             // Number-only and forced-case edits may transform supplied text; keep those copy-only.
             if ((style & (0x800 | 0x08 | 0x10 | 0x2000)) == 0 && Native.IsWindowEnabled(focusedHandle))
             {
@@ -152,20 +220,28 @@ public sealed class NativeTextBridge : IDisposable
             }
         }
 
-        if (element.TryGetCurrentPattern(TextPattern.Pattern, out var textObject))
+        // Chromium and document editors often expose the selection on the enclosing
+        // Document rather than on the focused leaf. Read selection only, never all text.
+        var selectionNode = element;
+        for (var depth = 0; depth < 64 && selectionNode is not null; depth++)
         {
-            var pattern = (TextPattern)textObject;
-            var ranges = pattern.GetSelection();
-            var selected = ranges.Where(r => !string.IsNullOrEmpty(r.GetText(1))).ToArray();
-            if (selected.Length > 1)
-                throw new InvalidOperationException("떨어져 있는 여러 영역은 한 번에 가져올 수 없어요. 한 영역만 선택해 주세요.");
-            if (selected.Length == 1)
+            if (selectionNode.TryGetCurrentPattern(TextPattern.Pattern, out var textObject))
             {
-                var text = selected[0].GetText(MaximumTextLength + 1);
-                CheckText(text);
-                return new(window, element.GetRuntimeId(), displayName,
-                    new CaptureSnapshot(text, displayName, "선택한 영역 · 복사로 사용"));
+                var pattern = (TextPattern)textObject;
+                var ranges = pattern.GetSelection();
+                var selected = ranges.Where(r => !string.IsNullOrEmpty(r.GetText(1))).ToArray();
+                if (selected.Length > 1)
+                    throw new InvalidOperationException("떨어져 있는 여러 영역은 한 번에 가져올 수 없어요. 한 영역만 선택해 주세요.");
+                if (selected.Length == 1)
+                {
+                    var text = selected[0].GetText(MaximumTextLength + 1);
+                    CheckText(text);
+                    return new(window, element.GetRuntimeId(), displayName,
+                        new CaptureSnapshot(text, displayName, "선택한 영역 · 복사로 사용"));
+                }
             }
+            if ((nint)selectionNode.Current.NativeWindowHandle == window) break;
+            selectionNode = TreeWalker.RawViewWalker.GetParent(selectionNode);
         }
 
         // A writable ValuePattern on an Edit is the only generic whole-field fallback.
@@ -180,12 +256,12 @@ public sealed class NativeTextBridge : IDisposable
                 new CaptureSnapshot(text, displayName, "현재 입력칸 전체 · 복사로 사용"));
         }
 
-        return new(window, element.GetRuntimeId(), displayName, null);
+        return new(window, element.GetRuntimeId(), displayName, null, element.Current.ProcessId);
     }
 
     private async Task<CaptureSnapshot> CaptureWithCopyAsync(CaptureAttempt attempt)
     {
-        var backup = await _dispatcher.InvokeAsync(BackupClipboard);
+        var backup = await BackupClipboardAsync();
         uint copiedSequence = 0;
         try
         {
@@ -202,17 +278,10 @@ public sealed class NativeTextBridge : IDisposable
                 var owner = Native.GetClipboardOwner();
                 Native.GetWindowThreadProcessId(owner, out var ownerPid);
                 Native.GetWindowThreadProcessId(attempt.Window, out var targetPid);
-                if (owner == 0 || ownerPid != targetPid)
+                if (!IsExpectedClipboardOwner(owner, ownerPid, targetPid, attempt.FocusedProcessId))
                     throw new InvalidOperationException("다른 앱에서 클립보드를 변경했어요. 글을 직접 붙여넣어 주세요.");
                 copiedSequence = sequence;
-                var text = await _dispatcher.InvokeAsync(() =>
-                {
-                    if (Native.GetClipboardSequenceNumber() != copiedSequence)
-                        throw new InvalidOperationException("클립보드가 변경되어 가져오기를 멈췄어요.");
-                    if (!System.Windows.Clipboard.ContainsText())
-                        throw new InvalidOperationException("선택한 글을 찾지 못했어요. 글을 블록으로 선택한 뒤 다시 눌러 주세요.");
-                    return System.Windows.Clipboard.GetText();
-                });
+                var text = await ReadCopiedTextAsync(copiedSequence);
                 await Task.Run(() => ValidateFocus(attempt)).WaitAsync(TimeSpan.FromSeconds(4));
                 CheckText(text);
                 return new CaptureSnapshot(text, attempt.DisplayName, "복사한 선택 영역 · 복사로 사용");
@@ -249,7 +318,7 @@ public sealed class NativeTextBridge : IDisposable
         if (!await _operationGate.WaitAsync(0)) return new(false, "이전 작업이 끝난 뒤 다시 시도해 주세요.");
         try
         {
-            await WaitForModifiersAsync();
+            await WaitForModifiersAsync(_hotkeyKey);
             // Check contents before activating the original app, then repeat after focus settles.
             await Task.Run(() => ValidateEdit(target, requireForeground: false));
             if (!Native.SetForegroundWindow(target.Window))
@@ -321,11 +390,11 @@ public sealed class NativeTextBridge : IDisposable
 
     private static void ValidateElement(nint window, AutomationElement element)
     {
-        Native.GetWindowThreadProcessId(window, out var pid);
-        if (element.Current.ProcessId != pid)
-            throw new InvalidOperationException("입력 위치를 확인하지 못했어요. 직접 붙여넣어 주세요.");
+        // Browser accessibility providers may run in a renderer process. The UIA
+        // ancestry must still reach the exact foreground HWND; PID equality alone
+        // incorrectly rejects otherwise valid selected text in those browsers.
         var node = element;
-        for (var i = 0; i < 32 && node is not null; i++)
+        for (var i = 0; i < 64 && node is not null; i++)
         {
             if (node.Current.IsPassword) throw new InvalidOperationException("비밀번호 입력칸은 가져오지 않아요.");
             if ((nint)node.Current.NativeWindowHandle == window) return;
@@ -340,7 +409,7 @@ public sealed class NativeTextBridge : IDisposable
         if (window == 0 || !Native.IsWindow(window) || Native.GetForegroundWindow() != window)
             throw new InvalidOperationException("원래 앱이 바뀌었어요. 글을 쓰던 앱에서 단축키를 눌러 주세요.");
         if (pid == Environment.ProcessId)
-            throw new InvalidOperationException("검사할 글이 있는 다른 앱에서 Ctrl + Alt + Space를 눌러 주세요.");
+            throw new InvalidOperationException("검사할 글이 있는 다른 앱에서 설정한 전역 단축키를 눌러 주세요.");
     }
 
     private static nint FocusedHandle(nint window)
@@ -365,14 +434,52 @@ public sealed class NativeTextBridge : IDisposable
 
     private static bool ModifiersDown() => new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C }.Any(k => Native.GetAsyncKeyState(k) < 0);
 
-    private static async Task WaitForModifiersAsync()
+    private static async Task WaitForModifiersAsync(uint triggerKey)
     {
-        for (var i = 0; i < 40; i++)
+        for (var i = 0; i < 80; i++)
         {
-            if (!ModifiersDown() && Native.GetAsyncKeyState(0x20) >= 0) return;
+            if (!ModifiersDown() && Native.GetAsyncKeyState((int)triggerKey) >= 0) return;
             await Task.Delay(25);
         }
         throw new InvalidOperationException("단축키에서 손을 뗀 뒤 다시 시도해 주세요.");
+    }
+
+    internal static bool IsExpectedClipboardOwner(nint owner, uint ownerPid, uint targetPid, int focusedPid)
+        // OpenClipboard(NULL) is legal and has no owner HWND. The foreground window
+        // and exact UIA focused element are revalidated before and after this read.
+        => owner == 0 || ownerPid == targetPid || focusedPid > 0 && ownerPid == (uint)focusedPid;
+
+    private async Task<ClipboardBackup> BackupClipboardAsync()
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try { return await _dispatcher.InvokeAsync(BackupClipboard); }
+            catch (ExternalException) when (attempt < 7) { await Task.Delay(25); }
+            catch (ExternalException) { throw new InvalidOperationException("다른 앱이 클립보드를 사용 중이에요. 잠시 후 단축키를 다시 눌러 주세요."); }
+        }
+    }
+
+    private async Task<string> ReadCopiedTextAsync(uint expectedSequence)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await _dispatcher.InvokeAsync(() =>
+                {
+                    if (Native.GetClipboardSequenceNumber() != expectedSequence)
+                        throw new InvalidOperationException("클립보드가 변경되어 가져오기를 멈췄어요.");
+                    if (!System.Windows.Clipboard.ContainsText())
+                        throw new InvalidOperationException("선택한 글을 찾지 못했어요. 글을 블록으로 선택한 뒤 다시 눌러 주세요.");
+                    var text = System.Windows.Clipboard.GetText();
+                    if (Native.GetClipboardSequenceNumber() != expectedSequence)
+                        throw new InvalidOperationException("클립보드가 변경되어 가져오기를 멈췄어요.");
+                    return text;
+                });
+            }
+            catch (ExternalException) when (attempt < 7) { await Task.Delay(25); }
+            catch (ExternalException) { throw new InvalidOperationException("원래 앱의 복사가 아직 끝나지 않았어요. 잠시 후 다시 눌러 주세요."); }
+        }
     }
 
     private static ClipboardBackup BackupClipboard()
@@ -392,6 +499,7 @@ public sealed class NativeTextBridge : IDisposable
                 byte[] bytes => bytes.ToArray(),
                 MemoryStream stream => new MemoryStream(stream.ToArray()),
                 BitmapSource bitmap => bitmap.Clone(),
+                System.Drawing.Image bitmap => bitmap.Clone(),
                 _ => throw new InvalidOperationException("현재 클립보드를 그대로 보존하기 어려워요. 글을 직접 복사해서 붙여넣어 주세요.")
             };
             if (copy is not null) clone.SetData(format, copy, autoConvert: false);
@@ -414,7 +522,8 @@ public sealed class NativeTextBridge : IDisposable
         _callback = null;
     }
 
-    private sealed record CaptureAttempt(nint Window, int[] RuntimeId, string DisplayName, CaptureSnapshot? Snapshot);
+    private sealed record CaptureAttempt(nint Window, int[] RuntimeId, string DisplayName, CaptureSnapshot? Snapshot,
+        int FocusedProcessId = 0, bool NoSelection = false);
     private sealed record ClipboardBackup(uint Sequence, System.Windows.DataObject? Data);
 
     private static class Native
@@ -504,6 +613,20 @@ public sealed class NativeTextBridge : IDisposable
             if (sent == events.Length) return;
             if (sent > 0) SendInput(1, new[] { Key(0x11, true) }, Marshal.SizeOf<Input>());
             throw new InvalidOperationException("이 앱에서 선택한 글을 복사할 수 없어요. 직접 복사해서 붙여넣어 주세요.");
+        }
+
+        internal static bool HasOpenMenu(nint window)
+        {
+            var thread = GetWindowThreadProcessId(window, out _);
+            var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf<GuiThreadInfo>() };
+            return GetGUIThreadInfo(thread, ref info) && (info.Flags & 0x1C) != 0;
+        }
+
+        internal static void DismissMenu()
+        {
+            var events = new[] { Key(0x1B), Key(0x1B, true) };
+            if (SendInput((uint)events.Length, events, Marshal.SizeOf<Input>()) == events.Length) return;
+            throw new InvalidOperationException("원래 앱의 메뉴를 닫지 못했어요. Esc로 메뉴를 닫고 설정한 단축키를 눌러 주세요.");
         }
 
         private static Input Key(ushort key, bool up = false) => new()

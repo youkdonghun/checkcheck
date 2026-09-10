@@ -40,12 +40,12 @@ internal sealed class QuickReviewWindow : Window
     {
         _snapshot = snapshot; _check = check; _write = write; _expand = expand;
         Title = temporary ? "체크체크 · 빠른 교정" : "체크체크 · 작은 창";
-        Width = 420; Height = temporary ? 390 : 540; MinWidth = 355; MinHeight = 330;
+        Width = 420; Height = temporary ? 480 : 540; MinWidth = 355; MinHeight = 420;
         Topmost = true; ShowInTaskbar = !temporary; ShowActivated = !temporary;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = Brush("#F7F8F4"); Foreground = Brush("#263D33"); FontFamily = new System.Windows.Media.FontFamily("Malgun Gothic");
         var grid = new Grid { Margin = new Thickness(16) };
-        foreach (var h in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto, GridLength.Auto }) grid.RowDefinitions.Add(new RowDefinition { Height = h });
+        foreach (var h in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto, GridLength.Auto }) grid.RowDefinitions.Add(new RowDefinition { Height = h });
         var header = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
         var full = MakeButton("크게 보기 ↗", (_, _) => { _expand(_source!.Text, _snapshot); Close(); });
         DockPanel.SetDock(full, Dock.Right); header.Children.Add(full);
@@ -55,21 +55,25 @@ internal sealed class QuickReviewWindow : Window
         _source.TextChanged += (_, _) => { _work?.Cancel(); _session = null; _suggestions?.Children.Clear(); if (_snapshot?.Text != _source.Text) _snapshot = null; UpdateActions(); };
         System.Windows.Automation.AutomationProperties.SetName(_source, "작은 창 원문");
         Grid.SetRow(_source, 1); grid.Children.Add(_source);
+        var sourceTools = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 6, 0, 0) };
+        sourceTools.Children.Add(MakeButton("붙여넣기", (_, _) => { try { if (System.Windows.Clipboard.ContainsText()) { _source.Text = System.Windows.Clipboard.GetText(); _status!.Text = "붙여넣었어요. 검사하기를 눌러주세요."; } } catch { _status!.Text = "클립보드를 사용할 수 없어요. 다시 시도해 주세요."; } }));
+        sourceTools.Children.Add(MakeButton("네이버 검사기 ↗", (_, _) => { try { _status!.Text = NaverWebChecker.Open(_source.Text); } catch (Exception ex) { _status!.Text = ex.Message; } }));
+        Grid.SetRow(sourceTools, 2); grid.Children.Add(sourceTools);
         var toolbar = new DockPanel { Margin = new Thickness(0, 10, 0, 8) };
-        _review = MakeButton("검사하기", async (_, _) => await ReviewAsync()); DockPanel.SetDock(_review, Dock.Right); toolbar.Children.Add(_review);
+        _review = MakeButton("검사하기", async (_, _) => { if (_work is not null) _work.Cancel(); else await ReviewAsync(); }); DockPanel.SetDock(_review, Dock.Right); toolbar.Children.Add(_review);
         _mode = new ComboBox { Width = 145, Margin = new Thickness(0, 0, 8, 0), VerticalContentAlignment = VerticalAlignment.Center, ItemsSource = new[] { "최소 교정", "자연스럽게", "업무용 말투" }, SelectedIndex = (int)mode };
         _mode.SelectionChanged += (_, _) => { _session = null; _suggestions?.Children.Clear(); UpdateActions(); };
         toolbar.Children.Add(_mode);
-        Grid.SetRow(toolbar, 2); grid.Children.Add(toolbar);
+        Grid.SetRow(toolbar, 3); grid.Children.Add(toolbar);
         _suggestions = new StackPanel();
         var scroll = new ScrollViewer { Content = _suggestions, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        Grid.SetRow(scroll, 3); grid.Children.Add(scroll);
+        Grid.SetRow(scroll, 4); grid.Children.Add(scroll);
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right, Margin = new Thickness(0, 10, 0, 7) };
         _copy = MakeButton("선택한 수정문 복사", (_, _) => { try { if (_session is not null) { System.Windows.Clipboard.SetText(_session.BuildAccepted()); _status!.Text = "복사했어요. 원래 입력칸에 붙여넣으세요."; } } catch { _status!.Text = "클립보드를 사용할 수 없어요. 다시 시도해 주세요."; } });
         _apply = MakeButton("반영", async (_, _) => await ApplyAsync());
-        actions.Children.Add(_copy); actions.Children.Add(_apply); Grid.SetRow(actions, 4); grid.Children.Add(actions);
+        actions.Children.Add(_copy); actions.Children.Add(_apply); Grid.SetRow(actions, 5); grid.Children.Add(actions);
         _status = new TextBlock { Text = "무료 로컬 AI · 수정할 부분만 확인하고 선택하세요.", FontSize = 11, Foreground = Brush("#72836F"), TextWrapping = TextWrapping.Wrap };
-        Grid.SetRow(_status, 5); grid.Children.Add(_status); Content = grid;
+        Grid.SetRow(_status, 6); grid.Children.Add(_status); Content = grid;
         UpdateActions();
         PreviewKeyDown += async (_, e) => { if (e.Key == Key.Escape) { e.Handled = true; Close(); } else if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; await ReviewAsync(); } };
         Closed += (_, _) => { _closed = true; _expiry.Stop(); _work?.Cancel(); };
@@ -78,8 +82,10 @@ internal sealed class QuickReviewWindow : Window
             _expiry.Tick += (_, _) => { if (!IsMouseOver && !IsActive) Close(); };
             _expiry.Start();
         }
-        if (temporary || snapshot is not null) Loaded += async (_, _) => await ReviewAsync();
+        if (!string.IsNullOrWhiteSpace(text) && (temporary || snapshot is not null)) Loaded += async (_, _) => await ReviewAsync();
     }
+
+    internal void SetNotice(string message) => _status.Text = message;
 
     internal void PlaceNear(int x, int y)
     {
@@ -99,12 +105,17 @@ internal sealed class QuickReviewWindow : Window
         if (string.IsNullOrWhiteSpace(_source.Text)) { _status.Text = "검사할 글을 입력해 주세요."; return; }
         if (_source.Text.Length > 3000) { _status.Text = "작은 창에서는 3,000자까지 검사해요. 필요한 부분만 선택해 주세요."; return; }
         using var work = new CancellationTokenSource(); _work = work;
-        _review.IsEnabled = _mode.IsEnabled = false; _review.Content = "검사 중…"; _session = null; UpdateActions();
+        _mode.IsEnabled = false; _review.Content = "중지"; _session = null; UpdateActions();
         _suggestions.Children.Clear(); _status.Text = "선택한 문장을 로컬 AI로 확인하고 있어요…";
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        string phase = "AI 준비 중";
+        var elapsed = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        elapsed.Tick += (_, _) => { if (!_closed && !work.IsCancellationRequested) _status.Text = $"{phase} · {watch.Elapsed.TotalSeconds:F1}초 · 중지 가능"; };
+        elapsed.Start();
         string text = _source.Text;
         try
         {
-            var result = await _check(text, (ReviewMode)_mode.SelectedIndex, new Progress<EngineProgress>(p => { if (!_closed && !work.IsCancellationRequested) _status.Text = p.Message; }), work.Token);
+            var result = await _check(text, (ReviewMode)_mode.SelectedIndex, new Progress<EngineProgress>(p => { if (!_closed && !work.IsCancellationRequested) phase = p.Message; }), work.Token);
             work.Token.ThrowIfCancellationRequested();
             if (_closed || _source.Text != text) return;
             _session = new ReviewSession(text, result.Suggestions);
@@ -119,11 +130,11 @@ internal sealed class QuickReviewWindow : Window
                 choice.Unchecked += (_, _) => { _session?.SetDecision(index, SuggestionDecision.Skipped); UpdateActions(); };
                 _suggestions.Children.Add(choice);
             }
-            _status.Text = result.Suggestions.Count == 0 ? "수정 제안을 찾지 못했어요. " + result.Note : $"수정 제안 {result.Suggestions.Count}개 · 반영할 항목을 체크하세요.";
+            _status.Text = result.Suggestions.Count == 0 ? "수정 제안을 찾지 못했어요. " + result.Note : $"{watch.Elapsed.TotalSeconds:F1}초 · 수정 제안 {result.Suggestions.Count}개 · 반영할 항목을 체크하세요.";
         }
-        catch (OperationCanceledException) { if (!_closed) _status.Text = "원문이 바뀌어 검사를 중지했어요. 다시 검사해 주세요."; }
+        catch (OperationCanceledException) { if (!_closed) _status.Text = "검사를 중지했어요. 필요한 부분만 선택하면 더 빨라요."; }
         catch (Exception ex) { if (!_closed) _status.Text = ex.Message; }
-        finally { _work = null; if (!_closed) { _review.IsEnabled = _mode.IsEnabled = true; _review.Content = "검사하기"; UpdateActions(); } }
+        finally { elapsed.Stop(); _work = null; if (!_closed) { _review.IsEnabled = _mode.IsEnabled = true; _review.Content = "검사하기"; UpdateActions(); } }
     }
 
     private async Task ApplyAsync()

@@ -10,7 +10,12 @@ public sealed class LocalModelProofreader : IProofreader, IDisposable
     private readonly LocalModelRuntime runtime;
     private readonly RuleProofreader rules = new();
     private readonly SemaphoreSlim reviewGate = new(1, 1);
+    // A small per-process cache makes reopening the same selection instant. No reviewed text
+    // is persisted; the key includes the exact original and requested mode.
+    private readonly Dictionary<(ReviewMode Mode, string Text), (string Revised, bool Rejected)> recent = new();
+    private readonly Queue<(ReviewMode Mode, string Text)> recentOrder = new();
     public bool IsInstalled => runtime.IsInstalled;
+    public bool IsReady => runtime.IsReady;
     public string ModelDisplayName => ModelCatalog.ModelDisplayName;
     public string DeviceDisplayName => runtime.DeviceDisplayName;
 
@@ -40,12 +45,23 @@ public sealed class LocalModelProofreader : IProofreader, IDisposable
                 var prefixLength = chunk.Length - chunk.TrimStart().Length;
                 var suffixLength = chunk.Length - chunk.TrimEnd().Length;
                 var body = chunk.Substring(prefixLength, chunk.Length - prefixLength - suffixLength);
-                // Deterministic spelling fixes support the model, including known Korean irregular forms.
-                var initialRules = await rules.ReviewAsync(body, ReviewMode.Minimal, null, cancellationToken).ConfigureAwait(false);
-                var prepared = new ReviewSession(body, initialRules.Suggestions).BuildPreview();
-                var revised = await runtime.CompleteAsync(BuildInstructions(mode), prepared, Math.Clamp(body.Length * 3 + 128, 256, 3072), cancellationToken).ConfigureAwait(false);
-                revised = revised.Trim();
-                if (!IsSafeRevision(body, revised)) { revised = prepared; rejected++; }
+                var key = (mode, body);
+                if (!recent.TryGetValue(key, out var cached))
+                {
+                    // Deterministic spelling fixes support the model, including known Korean irregular forms.
+                    var initialRules = await rules.ReviewAsync(body, ReviewMode.Minimal, null, cancellationToken).ConfigureAwait(false);
+                    var prepared = new ReviewSession(body, initialRules.Suggestions).BuildPreview();
+                    var output = await runtime.CompleteAsync(BuildInstructions(mode), prepared, Math.Clamp(body.Length * 3 + 128, 256, 3072), cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    output = output.Trim();
+                    var unsafeRevision = !IsSafeRevision(body, output);
+                    cached = (unsafeRevision ? prepared : output, unsafeRevision);
+                    if (recent.Count >= 16) recent.Remove(recentOrder.Dequeue());
+                    recent.Add(key, cached);
+                    recentOrder.Enqueue(key);
+                }
+                var revised = cached.Revised;
+                if (cached.Rejected) rejected++;
                 result.Append(chunk.AsSpan(0, prefixLength));
                 result.Append(revised);
                 if (suffixLength > 0) result.Append(chunk.AsSpan(chunk.Length - suffixLength));

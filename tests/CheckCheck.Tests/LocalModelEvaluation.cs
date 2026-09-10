@@ -19,6 +19,8 @@ internal static class LocalModelEvaluation
         });
         var startup = Stopwatch.StartNew();
         await engine.EnsureReadyAsync(progress, cancel.Token);
+        startup.Stop();
+        if (!engine.IsReady) throw new InvalidOperationException("Engine did not report ready after successful warmup.");
         Console.WriteLine($"Ready: {engine.DeviceDisplayName}, {startup.Elapsed.TotalSeconds:F1}s");
         var cases = new (string Name, ReviewMode Mode, string Original)[]
         {
@@ -29,7 +31,8 @@ internal static class LocalModelEvaluation
             ("English business", ReviewMode.Business, "Send me the report by Friday. I need it for the meeting."),
             ("Natural Korean", ReviewMode.Natural, "이 부분에 대해서는 제가 생각하기에는 조금 더 검토를 하는 것이 필요할 것 같습니다."),
             ("Clean Korean", ReviewMode.Minimal, "내일 오후 3시까지 보고서를 보내 주세요. 감사합니다."),
-            ("Preserve facts", ReviewMode.Business, "김민수 팀장님, 오늘 18시까지 API 오류 3개는 고칠 수 없어요. https://example.com/teh 확인해 주세요.")
+            ("Preserve facts", ReviewMode.Business, "김민수 팀장님, 오늘 18시까지 API 오류 3개는 고칠 수 없어요. https://example.com/teh 확인해 주세요."),
+            ("Cached Korean spelling", ReviewMode.Minimal, "회의에 참석하지 못할것 같아요. 몇일 뒤에 다시 연락드릴께요.")
         };
         var records = new List<object>();
         foreach (var item in cases)
@@ -42,8 +45,27 @@ internal static class LocalModelEvaluation
             records.Add(record);
             Console.WriteLine(JsonSerializer.Serialize(record, new JsonSerializerOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
         }
+        // Cancel an active request, then start another: a dismissed popup must not leave a
+        // complete paragraph generating ahead of the next selection in the server queue.
+        using var interrupted = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        var cancellationTimer = Stopwatch.StartNew();
+        var cancellationObserved = false;
+        try
+        {
+            await engine.ReviewAsync(string.Join(" ", Enumerable.Repeat("새로 작성한 자료를 검토한후 수정해야할 부분을 알려주세요.", 12)),
+                ReviewMode.Natural, null, interrupted.Token);
+        }
+        catch (OperationCanceledException) { cancellationObserved = true; }
+        cancellationTimer.Stop();
+        if (!cancellationObserved) throw new InvalidOperationException("Active inference ignored cancellation.");
+        var nextTimer = Stopwatch.StartNew();
+        var next = await engine.ReviewAsync("새로운 문서에 오타가있는지 확인해 주세요.", ReviewMode.Minimal, null, cancel.Token);
+        nextTimer.Stop();
+        Console.WriteLine($"Canceled in {cancellationTimer.Elapsed.TotalSeconds:F3}s; next selection completed in {nextTimer.Elapsed.TotalSeconds:F3}s.");
         Directory.CreateDirectory(".cache/qa");
-        await File.WriteAllTextAsync(".cache/qa/local-model-evaluation.json", JsonSerializer.Serialize(new { engine.ModelDisplayName, engine.DeviceDisplayName, Cases = records },
+        await File.WriteAllTextAsync(".cache/qa/local-model-evaluation.json", JsonSerializer.Serialize(new { engine.ModelDisplayName, engine.DeviceDisplayName,
+            StartupSeconds = startup.Elapsed.TotalSeconds, CancellationSeconds = cancellationTimer.Elapsed.TotalSeconds,
+            NextSelectionSeconds = nextTimer.Elapsed.TotalSeconds, Cases = records },
             new JsonSerializerOptions { WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), cancel.Token);
     }
 }

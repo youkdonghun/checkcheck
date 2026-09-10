@@ -1,4 +1,4 @@
-﻿param([switch]$SkipTests)
+param([switch]$SkipTests, [string]$OutputDirectory = 'dist')
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $dotnetCommand = Get-Command dotnet -ErrorAction SilentlyContinue
@@ -8,7 +8,7 @@ if (-not $SkipTests) {
     & $dotnetExe run --project (Join-Path $projectRoot 'tests\CheckCheck.Tests\CheckCheck.Tests.csproj') -c Release
     if ($LASTEXITCODE -ne 0) { throw 'Core tests failed.' }
 }
-$releasePath = Join-Path $projectRoot 'dist'
+$releasePath = [IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory))
 & $dotnetExe publish (Join-Path $projectRoot 'src\CheckCheck.App\CheckCheck.App.csproj') -c Release -r win-x64 --self-contained true -o $releasePath -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\사용안내.txt') -Destination (Join-Path $releasePath '사용안내.txt') -Force

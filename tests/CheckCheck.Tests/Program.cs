@@ -131,4 +131,5 @@ canceled.Cancel();
 try { await rules.ReviewAsync("teh", ReviewMode.Minimal, null, canceled.Token); throw new Exception("Cancellation was ignored"); }
 catch (OperationCanceledException) { count++; }
 count += await BareunTests.RunAsync();
+count += LocalRuntimeTests.Run();
 Console.WriteLine($"PASS: {count} checks (diff, Unicode, review decisions, safety, offline rules)");

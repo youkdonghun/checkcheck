@@ -48,18 +48,20 @@ public partial class MainWindow : Window
         NaturalMode.IsEnabled = BusinessMode.IsEnabled = BareunEngine.IsChecked != true;
         Loaded += async (_, _) =>
         {
-            if (!App.IsTestRun && LocalEngine.IsChecked == true && !_local.IsInstalled)
-                await PrepareLocalAiAsync();
+            if (App.IsTestRun || LocalEngine.IsChecked != true) return;
+            if (!_local.IsInstalled) await PrepareLocalAiAsync();
+            else await WarmInstalledAiAsync();
         };
         Loaded += async (_, _) => await CheckUpdateAsync(false);
         PreviewKeyDown += HandleKeys;
         SourceInitialized += (_, _) =>
         {
-            try { _native.RegisterHotKey(this, async () => await CaptureSelectionAsync(), _hotkeyModifiers, _hotkeyKey); }
+            try { _native.RegisterHotKeyAsync(this, CaptureSelectionAsync, _hotkeyModifiers, _hotkeyKey); }
             catch { SetStatus("전역 단축키를 등록하지 못했어요. 클립보드에서 가져오기는 사용할 수 있어요.", true); }
             ConfigurePopupWatcher();
         };
-        Closed += (_, _) => { _work?.Cancel(); _quick?.Close(); _popupWatcher?.Dispose(); _native.Dispose(); _local.Dispose(); };
+        Closed += (_, _) => { _work?.Cancel(); _warmupCancel.Cancel(); _quick?.Close(); _launcher?.Close(); _popupWatcher?.Dispose(); _native.Dispose(); _local.Dispose(); };
+        _native.HotkeyFailed += ex => SetStatus(ex.Message, true);
         ShortcutLabel.Text = ShortcutText(_hotkeyModifiers, _hotkeyKey);
         UpdateEngineStatus();
         UpdateViewButtons();
@@ -88,14 +90,15 @@ public partial class MainWindow : Window
         InvalidateReview();
         UpdateEngineStatus();
         SaveSettings();
-        SetStatus(BareunEngine.IsChecked == true ? "바른 API는 한국어 교정 전용이에요. 검사할 글을 바른 서버에 전송합니다. API 키는 설정에서 입력해 주세요." : LocalEngine.IsChecked == true ? "로컬 AI로 한글·영문 문장을 검사해요. 글은 이 PC에서만 처리합니다." : "간단 규칙은 등록된 오탈자만 확인하는 보조 기능이에요. 일반적인 문장 교정은 로컬 AI를 선택해 주세요.");
+        SetStatus(BareunEngine.IsChecked == true ? "바른 API는 한국어 교정 전용이에요. 검사할 글을 바른 서버에 전송합니다. API 키는 설정에서 입력해 주세요." : "로컬 AI로 한글·영문 문장을 검사해요. 글은 이 PC에서만 처리합니다.");
+        if (LocalEngine.IsChecked == true && _local.IsInstalled && !App.IsTestRun) _ = WarmInstalledAiAsync();
     }
 
     private void UpdateEngineStatus()
     {
         SourceEditor.MaxLength = LocalEngine.IsChecked == true ? 3000 : 10000;
         CharacterCount.Text = $"{SourceEditor.Text.Length:N0} / {SourceEditor.MaxLength:N0}자";
-        EngineStatus.Text = BareunEngine.IsChecked == true ? (string.IsNullOrWhiteSpace(_bareunKey) ? "API 키를 설정해 주세요" : "한국어 교정 · 클라우드") : LocalEngine.IsChecked == true ? (_local.IsInstalled ? _local.ModelDisplayName + " · 준비됨" : "첫 실행 시 모델 자동 다운로드") : "등록된 오탈자만 확인";
+        EngineStatus.Text = BareunEngine.IsChecked == true ? (string.IsNullOrWhiteSpace(_bareunKey) ? "API 키를 설정해 주세요" : "한국어 교정 · 클라우드") : _local.IsReady ? "로컬 AI · 준비됨" : _warming ? "AI 미리 불러오는 중…" : _local.IsInstalled ? "검사할 때 AI를 준비해요" : "첫 실행 시 모델 자동 다운로드";
         SetupButton.Content = _local.IsInstalled ? "AI 확인" : "다운로드 시작";
         PrivacyTitle.Text = BareunEngine.IsChecked == true ? "바른 API로 검사" : "내 PC에서만 검사";
         PrivacyDescription.Text = BareunEngine.IsChecked == true ? "검사할 글을 바른 서버에\n전송해 교정합니다." : "입력한 글은 외부로\n전송하지 않아요.";
@@ -110,7 +113,7 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(text)) { SetStatus("먼저 검사할 글을 입력해 주세요.", true); SourceEditor.Focus(); return; }
         if (text.Length > 10000) { SetStatus("한 번에 10,000자까지 검사할 수 있어요. 글을 나눠서 검사해 주세요.", true); return; }
         if (BareunEngine.IsChecked == true && string.IsNullOrWhiteSpace(_bareunKey)) { ApiSetupClick(this, new RoutedEventArgs()); return; }
-        if (LocalEngine.IsChecked == true && !_local.IsInstalled && !await PrepareLocalAiAsync()) return;
+        if (LocalEngine.IsChecked == true && !App.IsTestRun && !_local.IsInstalled && !await PrepareLocalAiAsync()) return;
         // Preparation allows editing. Capture the latest input before starting inference.
         text = SourceEditor.Text;
         if (string.IsNullOrWhiteSpace(text)) { SetStatus("AI 준비가 끝났어요. 검사할 글을 입력해 주세요."); return; }
@@ -119,7 +122,7 @@ public partial class MainWindow : Window
         try
         {
             using var cloud = BareunEngine.IsChecked == true ? new BareunProofreader(_bareunKey) : null;
-            var provider = cloud is not null ? (IProofreader)cloud : LocalEngine.IsChecked == true ? (IProofreader)_local : _rules;
+            var provider = App.IsTestRun ? (IProofreader)_rules : cloud is not null ? (IProofreader)cloud : _local;
             var response = await provider.ReviewAsync(text, Mode, ProgressReporter(), token);
             token.ThrowIfCancellationRequested();
             if (SourceEditor.Text != text) { SetStatus("원문이 바뀌어서 이전 검사 결과를 적용하지 않았어요.", true); return; }
@@ -190,7 +193,7 @@ public partial class MainWindow : Window
         SetupButton.IsEnabled = false;
         ApiSetupButton.IsEnabled = false;
         MinimalMode.IsEnabled = NaturalMode.IsEnabled = BusinessMode.IsEnabled = false;
-        RulesEngine.IsEnabled = LocalEngine.IsEnabled = BareunEngine.IsEnabled = false;
+        LocalEngine.IsEnabled = BareunEngine.IsEnabled = false;
         ApplyButton.IsEnabled = CopyButton.IsEnabled = AcceptAllButton.IsEnabled = UndoButton.IsEnabled = false;
         CancelButton.Visibility = WorkProgress.Visibility = Visibility.Visible;
         CancelButton.Content = _preparing ? "준비 중지" : "취소";
@@ -207,7 +210,7 @@ public partial class MainWindow : Window
         ReviewButton.Content = "검사하기  →";
         MinimalMode.IsEnabled = NaturalMode.IsEnabled = BusinessMode.IsEnabled = true;
         NaturalMode.IsEnabled = BusinessMode.IsEnabled = BareunEngine.IsChecked != true;
-        RulesEngine.IsEnabled = LocalEngine.IsEnabled = BareunEngine.IsEnabled = true;
+        LocalEngine.IsEnabled = BareunEngine.IsEnabled = true;
         CancelButton.Visibility = WorkProgress.Visibility = Visibility.Collapsed;
         UpdateDecisionButtons();
     }
@@ -270,13 +273,19 @@ public partial class MainWindow : Window
         try
         {
             var captured = await _native.CaptureAsync();
-            if (captured is null) { BringToFront(); SetStatus("선택한 글을 가져오지 못했어요. 글을 복사한 뒤 ‘클립보드에서 가져오기’를 눌러주세요.", true); return; }
+            if (captured is null) { ShowCaptureFallback("선택한 글을 읽지 못했어요. 글을 복사한 뒤 붙여넣기로 검사해 주세요."); return; }
             if (_preferCompact && !_preparing) { OpenQuick(captured.Text, captured, false); return; }
             BringToFront();
             SetSource(captured.Text, captured);
             SetStatus(captured.CanApply ? "선택한 글을 가져왔어요. 검토 후 원래 입력칸에 반영할 수 있어요." : "글을 가져왔어요. 이 앱에서는 교정문을 복사해서 붙여넣어 주세요.");
         }
-        catch (Exception ex) { BringToFront(); SetStatus(FriendlyError(ex), true); }
+        catch (Exception ex) { ShowCaptureFallback(FriendlyError(ex)); }
+    }
+
+    private void ShowCaptureFallback(string message)
+    {
+        if (_preferCompact && !_preparing) { OpenQuick("", null, false); _quick?.SetNotice(message); }
+        else { BringToFront(); SetStatus(message, true); }
     }
 
     private void BringToFront() { if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal; Show(); Activate(); }
@@ -439,7 +448,7 @@ public partial class MainWindow : Window
         Grid.SetRow(save, 2); grid.Children.Add(save); window.Content = grid; window.ShowDialog();
     }
     private sealed class UserSettings { public int Version { get; set; } public bool UseLocalAi { get; set; } public bool UseBareun { get; set; } public uint HotkeyModifiers { get; set; } = 3; public uint HotkeyKey { get; set; } = 0x20; public bool PopupEnabled { get; set; } = true; public bool PreferCompact { get; set; } = true; public string? EncryptedBareunKey { get; set; } public List<string> ProtectedWords { get; set; } = []; }
-    private static bool SelectLocalAi(UserSettings settings) => !settings.UseBareun && (settings.Version < 2 || settings.UseLocalAi);
+    private static bool SelectLocalAi(UserSettings settings) => !settings.UseBareun;
     private void LoadSettings()
     {
         if (App.IsTestRun) return;
@@ -458,7 +467,6 @@ public partial class MainWindow : Window
             }
             LocalEngine.IsChecked = SelectLocalAi(settings);
             BareunEngine.IsChecked = settings.UseBareun;
-            RulesEngine.IsChecked = !SelectLocalAi(settings) && !settings.UseBareun;
             if (settings.UseBareun) MinimalMode.IsChecked = true;
         }
         catch { /* A missing or damaged preference file never prevents startup. */ }
@@ -491,10 +499,9 @@ public partial class MainWindow : Window
 
     internal async Task RunUiSmokeAsync(string imagePath)
     {
-        if (LocalEngine.IsChecked != true || RulesEngine.IsChecked == true) throw new InvalidOperationException("UI smoke: local AI must be the default.");
-        if (!SelectLocalAi(new UserSettings()) || SelectLocalAi(new UserSettings { UseBareun = true }) || SelectLocalAi(new UserSettings { Version = 2, UseLocalAi = false }))
+        if (LocalEngine.IsChecked != true) throw new InvalidOperationException("UI smoke: local AI must be the default.");
+        if (!SelectLocalAi(new UserSettings()) || SelectLocalAi(new UserSettings { UseBareun = true }) || !SelectLocalAi(new UserSettings { Version = 2, UseLocalAi = false }))
             throw new InvalidOperationException("UI smoke: engine preference migration failed.");
-        RulesEngine.IsChecked = true;
         SourceEditor.Text = "자료 확인햇어요. 몇일 전에 보낸 메일을 검토해 주세요.\nI has recieved your email.";
         await ReviewAsync();
         if (_session is null || _session.Suggestions.Count < 2) throw new InvalidOperationException("UI smoke: no expected suggestions.");

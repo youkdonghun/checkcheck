@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Encodings.Web;
+using System.Text.RegularExpressions;
 
 namespace CheckCheck.Core;
 
@@ -20,10 +21,15 @@ public sealed class LocalModelRuntime : IDisposable
     private Process? process;
     private Uri? serverUri;
     private bool modelVerified;
+    private volatile bool ready;
     private bool disposed;
     public bool IsInstalled => File.Exists(ModelCatalog.ModelPath) && new FileInfo(ModelCatalog.ModelPath).Length == ModelCatalog.ModelSize &&
         (FindServer(ModelCatalog.RuntimeDirectory(false)) != null || FindServer(ModelCatalog.RuntimeDirectory(true)) != null);
     public string DeviceDisplayName { get; private set; } = "내 PC";
+    public bool IsReady
+    {
+        get { try { return ready && process is { HasExited: false }; } catch (InvalidOperationException) { return false; } }
+    }
 
     public LocalModelRuntime() => downloadClient.DefaultRequestHeaders.UserAgent.ParseAdd("CheckCheck/0.2 (+https://github.com/youkdonghun/checkcheck)");
 
@@ -35,7 +41,7 @@ public sealed class LocalModelRuntime : IDisposable
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (process is { HasExited: false }) return;
+            if (IsReady) return;
             if (!OperatingSystem.IsWindows() || System.Runtime.InteropServices.RuntimeInformation.OSArchitecture != System.Runtime.InteropServices.Architecture.X64)
                 throw new PlatformNotSupportedException("로컬 교정은 Windows 10/11 64비트 PC를 지원해요.");
             Directory.CreateDirectory(ModelCatalog.CacheRoot);
@@ -80,7 +86,9 @@ public sealed class LocalModelRuntime : IDisposable
             model = "checkcheck-local",
             messages = new[] { new { role = "system", content = instructions }, new { role = "user", content = JsonSerializer.Serialize(new { original = text }, new JsonSerializerOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }) } },
             temperature = 0.2, top_p = 0.8, top_k = 20, min_p = 0.0, repeat_penalty = 1.05, seed = 42,
-            max_tokens = maximumTokens, stream = false, cache_prompt = false,
+            // The fixed proofreading instructions remain in the private server's RAM; never on disk.
+            // Reusing that prefix avoids re-evaluating hundreds of tokens for every selection.
+            max_tokens = maximumTokens, stream = false, cache_prompt = true,
             chat_template_kwargs = new { enable_thinking = false },
             response_format = new
             {
@@ -222,6 +230,7 @@ public sealed class LocalModelRuntime : IDisposable
     private async Task StartAsync(string executable, bool cpu, IProgress<EngineProgress>? progress, CancellationToken ct)
     {
         StopProcess();
+        var device = cpu ? null : await FindPreferredDeviceAsync(executable, ct).ConfigureAwait(false);
         progress?.Report(new(cpu ? "CPU에서 교정 모델을 불러오고 있어요." : "내 PC에서 교정 모델을 불러오고 있어요."));
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -234,8 +243,9 @@ public sealed class LocalModelRuntime : IDisposable
         foreach (var key in info.Environment.Keys.Where(k => k.StartsWith("LLAMA_", StringComparison.OrdinalIgnoreCase)).ToArray()) info.Environment.Remove(key);
         foreach (var arg in new[] { "--model", ModelCatalog.ModelPath, "--alias", "checkcheck-local", "--host", "127.0.0.1", "--port", port.ToString(),
             "--ctx-size", "8192", "--parallel", "1", "--threads", Math.Clamp(Environment.ProcessorCount / 2, 2, 8).ToString(),
-            "--batch-size", "256", "--ubatch-size", "128", "--n-gpu-layers", cpu ? "0" : "99", "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
-            "--jinja", "--chat-template-kwargs", "{\"enable_thinking\":false}", "--reasoning", "off", "--no-webui", "--no-slots", "--no-cache-prompt", "--no-agent", "--offline", "--log-disable" }) info.ArgumentList.Add(arg);
+            "--batch-size", cpu ? "256" : "512", "--ubatch-size", cpu ? "128" : "256", "--n-gpu-layers", cpu ? "0" : "99", "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+            "--jinja", "--chat-template-kwargs", "{\"enable_thinking\":false}", "--reasoning", "off", "--no-webui", "--no-slots", "--cache-prompt", "--no-agent", "--offline", "--log-disable" }) info.ArgumentList.Add(arg);
+        if (device != null) { info.ArgumentList.Add("--device"); info.ArgumentList.Add(device.Value.Id); }
         info.Environment["LLAMA_API_KEY"] = token;
         process = Process.Start(info) ?? throw new InvalidOperationException("로컬 엔진을 실행하지 못했어요.");
         process.OutputDataReceived += (_, _) => { }; process.ErrorDataReceived += (_, _) => { };
@@ -252,7 +262,13 @@ public sealed class LocalModelRuntime : IDisposable
                 using var probe = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 probe.CancelAfter(TimeSpan.FromSeconds(2));
                 using var response = await localClient.GetAsync(new Uri(serverUri, "health"), probe.Token).ConfigureAwait(false);
-                if (response.IsSuccessStatusCode) { DeviceDisplayName = cpu ? "CPU" : "그래픽 가속"; progress?.Report(new("로컬 교정 준비 완료", 1)); return; }
+                if (response.IsSuccessStatusCode)
+                {
+                    // A Vulkan executable alone does not prove GPU acceleration is available.
+                    DeviceDisplayName = cpu ? "CPU" : device == null ? "로컬 엔진 · 장치 자동 선택" : device.Value.Name;
+                    ready = true;
+                    progress?.Report(new("로컬 교정 준비 완료", 1)); return;
+                }
             }
             catch (HttpRequestException) { }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
@@ -261,8 +277,43 @@ public sealed class LocalModelRuntime : IDisposable
         throw new TimeoutException("교정 모델을 불러오는 데 시간이 오래 걸려요. 다른 프로그램을 닫고 다시 시도해 주세요.");
     }
 
+    private static async Task<(string Id, string Name)?> FindPreferredDeviceAsync(string executable, CancellationToken ct)
+    {
+        // Vulkan device 0 can be integrated graphics on hybrid laptops. Prefer a discrete GPU
+        // with enough free memory for this 4B model, rather than spreading it onto shared memory.
+        var info = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var key in info.Environment.Keys.Where(k => k.StartsWith("LLAMA_", StringComparison.OrdinalIgnoreCase)).ToArray()) info.Environment.Remove(key);
+        info.ArgumentList.Add("--list-devices");
+        using var probe = Process.Start(info);
+        if (probe == null) return null;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            var stdout = probe.StandardOutput.ReadToEndAsync(timeout.Token);
+            var stderr = probe.StandardError.ReadToEndAsync(timeout.Token);
+            await probe.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            var devices = ParseDevices(await stdout.ConfigureAwait(false) + "\n" + await stderr.ConfigureAwait(false));
+            return devices.Count == 0 ? null : devices[0];
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return null; }
+        finally { if (!probe.HasExited) try { probe.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } }
+    }
+
+    internal static IReadOnlyList<(string Id, string Name)> ParseDevices(string text)
+    {
+        return Regex.Matches(text, @"(?m)^\s*(Vulkan\d+):\s*(.+?)\s+\((\d+) MiB,\s*(\d+) MiB free\)")
+            .Select(m => new { Id = m.Groups[1].Value, Name = m.Groups[2].Value, Free = long.Parse(m.Groups[4].Value) })
+            .OrderByDescending(d => d.Free >= ModelCatalog.ModelSize / 1048576 + 600 &&
+                Regex.IsMatch(d.Name, @"NVIDIA|Radeon\s+(?:RX|PRO)|(?:Intel.*)?Arc", RegexOptions.IgnoreCase))
+            .ThenByDescending(d => d.Free)
+            .Select(d => (d.Id, d.Name)).ToArray();
+    }
+
     private void StopProcess()
     {
+        ready = false;
         var owned = Interlocked.Exchange(ref process, null);
         serverUri = null;
         if (owned == null) return;
