@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+.tools/
+.cache/
+dist/
+*.user
+*.suo
+*.log
+.env*
+!.env.example

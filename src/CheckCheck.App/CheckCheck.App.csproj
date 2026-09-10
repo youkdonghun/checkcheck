@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>체크체크</AssemblyName>
+    <RootNamespace>CheckCheck.App</RootNamespace>
+    <ApplicationIcon>Assets/checkcheck.ico</ApplicationIcon>
+    <Version>0.2.0</Version>
+    <Company>CheckCheck</Company>
+    <Product>체크체크</Product>
+    <Description>내 PC에서 쓰는 한글·영문 문장 교정 도구</Description>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CheckCheck.Core/CheckCheck.Core.csproj" />
+  </ItemGroup>
+</Project>
