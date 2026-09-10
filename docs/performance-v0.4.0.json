@@ -1,0 +1,75 @@
+{
+  "Version": "0.4.0",
+  "Date": "2026-09-10",
+  "Source": {
+    "Url": "https://d2.naver.com/helloworld/9582944",
+    "Title": "2024 네이버 통합검색의 웹 성능 리뷰",
+    "Extraction": "Visible article paragraphs only; headings and images omitted. Source body is not included in this repository."
+  },
+  "Mode": "Minimal",
+  "Model": "Qwen3 4B",
+  "Device": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "Timing": "Review timing excludes model preparation, model download, clipboard paste and native selection capture. Each WPF case used a fresh process and empty application result cache. FirstCheckedSeconds means the first completed chunk, even with zero suggestions.",
+  "CurrentWpf": [
+    {
+      "Entry": "Right-click review window → clipboard paste → real installed AI",
+      "Characters": 2152,
+      "Sha256": "a71d2a8e36bbb4cff42441583656e48df8f0c5fff955e72712c132df0802eaf6",
+      "ModelDisplayName": "Qwen3 4B · 내 PC",
+      "DeviceDisplayName": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+      "StartupSeconds": 10.8690265,
+      "ReviewSeconds": 2.9809323,
+      "FirstCheckedSeconds": 1.5425618,
+      "Suggestions": 0,
+      "Note": "로컬 모델의 제안이에요. 이름·사실·의미가 유지되는지 원문과 비교해 주세요."
+    },
+    {
+      "Entry": "Right-click review window → clipboard paste → real installed AI",
+      "Characters": 6177,
+      "Sha256": "cc408c2fe6d69b6f7764aa6107a7ec41b61f1d17b2624bfe1a3ed588ec88370c",
+      "ModelDisplayName": "Qwen3 4B · 내 PC",
+      "DeviceDisplayName": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+      "StartupSeconds": 11.357977,
+      "ReviewSeconds": 8.6755111,
+      "FirstCheckedSeconds": 1.6044915,
+      "Suggestions": 0,
+      "Note": "로컬 모델의 제안이에요. 이름·사실·의미가 유지되는지 원문과 비교해 주세요."
+    }
+  ],
+  "PreviousV030Core": [
+    {
+      "Run": 1,
+      "Characters": 2152,
+      "Seconds": 39.5265765,
+      "SuggestionCount": 2
+    },
+    {
+      "Run": 2,
+      "Characters": 2152,
+      "Seconds": 37.049382,
+      "SuggestionCount": 2
+    }
+  ],
+  "SeededCurrentCore": [
+    {
+      "Run": 1,
+      "Characters": 2152,
+      "Seconds": 6.7531043,
+      "FirstPartialSeconds": 3.6235101,
+      "SuggestionCount": 3
+    },
+    {
+      "Run": 2,
+      "Characters": 2152,
+      "Seconds": 5.9066446,
+      "FirstPartialSeconds": 2.787463,
+      "SuggestionCount": 3
+    }
+  ],
+  "Quality": {
+    "InsertedErrors": 6,
+    "Corrected": 3,
+    "Missed": 3,
+    "Note": "Small diagnostic example, not a general accuracy estimate. Long-document detection can miss errors before correction."
+  }
+}

@@ -24,9 +24,4 @@ public partial class MainWindow
         finally { _warming = false; if (!_warmupCancel.IsCancellationRequested) UpdateEngineStatus(); }
     }
 
-    private void NaverClick(object sender, RoutedEventArgs e)
-    {
-        try { SetStatus(NaverWebChecker.Open(SourceEditor.Text)); }
-        catch (Exception ex) { SetStatus(FriendlyError(ex), true); }
-    }
 }

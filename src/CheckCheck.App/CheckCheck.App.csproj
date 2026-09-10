@@ -9,7 +9,7 @@
     <AssemblyName>체크체크</AssemblyName>
     <RootNamespace>CheckCheck.App</RootNamespace>
     <ApplicationIcon>Assets/checkcheck.ico</ApplicationIcon>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <Company>CheckCheck</Company>
     <Product>체크체크</Product>
     <Description>내 PC에서 쓰는 한글·영문 문장 교정 도구</Description>

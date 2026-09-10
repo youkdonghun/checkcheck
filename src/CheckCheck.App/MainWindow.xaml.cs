@@ -30,7 +30,7 @@ public partial class MainWindow : Window
     private ReviewSession? _session;
     private CaptureSnapshot? _snapshot;
     private CancellationTokenSource? _work;
-    private bool _ready, _busy, _preparing, _settingSource, _step;
+    private bool _ready, _busy, _preparing, _settingSource, _step, _reviewComplete;
     private int _stepIndex;
     private readonly List<string> _protectedWords = [];
     private string _bareunKey = "";
@@ -96,7 +96,7 @@ public partial class MainWindow : Window
 
     private void UpdateEngineStatus()
     {
-        SourceEditor.MaxLength = LocalEngine.IsChecked == true ? 3000 : 10000;
+        SourceEditor.MaxLength = 10000;
         CharacterCount.Text = $"{SourceEditor.Text.Length:N0} / {SourceEditor.MaxLength:N0}자";
         EngineStatus.Text = BareunEngine.IsChecked == true ? (string.IsNullOrWhiteSpace(_bareunKey) ? "API 키를 설정해 주세요" : "한국어 교정 · 클라우드") : _local.IsReady ? "로컬 AI · 준비됨" : _warming ? "AI 미리 불러오는 중…" : _local.IsInstalled ? "검사할 때 AI를 준비해요" : "첫 실행 시 모델 자동 다운로드";
         SetupButton.Content = _local.IsInstalled ? "AI 확인" : "다운로드 시작";
@@ -118,21 +118,24 @@ public partial class MainWindow : Window
         text = SourceEditor.Text;
         if (string.IsNullOrWhiteSpace(text)) { SetStatus("AI 준비가 끝났어요. 검사할 글을 입력해 주세요."); return; }
         StartWork("문장을 확인하고 있어요…");
+        _reviewComplete = false;
         var token = _work!.Token;
         try
         {
             using var cloud = BareunEngine.IsChecked == true ? new BareunProofreader(_bareunKey) : null;
-            var provider = App.IsTestRun ? (IProofreader)_rules : cloud is not null ? (IProofreader)cloud : _local;
+            var provider = App.IsTestRun && !App.IsLiveBenchmark ? (IProofreader)_rules : cloud is not null ? (IProofreader)cloud : _local;
             var response = await provider.ReviewAsync(text, Mode, ProgressReporter(), token);
             token.ThrowIfCancellationRequested();
             if (SourceEditor.Text != text) { SetStatus("원문이 바뀌어서 이전 검사 결과를 적용하지 않았어요.", true); return; }
             var filtered = response.Suggestions.Where(s => !_protectedWords.Any(word => s.Original.Contains(word, StringComparison.OrdinalIgnoreCase) && !s.Replacement.Contains(word, StringComparison.OrdinalIgnoreCase))).ToArray();
-            _session = new ReviewSession(text, filtered);
+            MergeReview(text, filtered);
+            _reviewComplete = true;
             _stepIndex = 0;
             RenderSession();
             string countMessage = filtered.Length == 0 ? "이번 검사에서 수정 제안을 찾지 못했어요. 모든 문장이 정확하다는 뜻은 아니에요." : $"수정 제안 {filtered.Length}개를 찾았어요. 확인한 내용만 선택해 주세요.";
             if (filtered.Length < response.Suggestions.Count) countMessage += " 보호할 단어가 바뀌는 제안은 제외했어요.";
             SetStatus(countMessage + (string.IsNullOrEmpty(response.Note) ? "" : " " + response.Note));
+            if (_benchmarkWatch?.IsRunning == true) _benchmarkCompleted = true;
         }
         catch (OperationCanceledException) { SetStatus("검사를 취소했어요. 원문은 그대로 유지됩니다."); }
         catch (Exception ex) { SetStatus(FriendlyError(ex), true); }
@@ -175,13 +178,36 @@ public partial class MainWindow : Window
         ((TextBlock)EmptyPanel.Children[1]).Text = "모델 약 2.4GB · 창을 닫아도 다운로드는 계속돼요.\n기다리는 동안 검사할 글을 입력해 두세요.";
     }
 
-    private IProgress<EngineProgress> ProgressReporter() => new Progress<EngineProgress>(p =>
+    private IProgress<EngineProgress> ProgressReporter()
     {
-        if (!_busy) return;
-        SetStatus(p.Message);
-        WorkProgress.IsIndeterminate = !p.Fraction.HasValue;
-        if (p.Fraction.HasValue) WorkProgress.Value = Math.Clamp(p.Fraction.Value * 100, 0, 100);
-    });
+        var currentWork = _work;
+        return new Progress<EngineProgress>(p =>
+        {
+            if (!_busy || _work != currentWork || currentWork?.IsCancellationRequested == true) return;
+            if (p.PartialResult is { } partial && partial.Original == SourceEditor.Text)
+            {
+                if (_benchmarkWatch?.IsRunning == true)
+                {
+                    _firstCheckedSeconds ??= _benchmarkWatch.Elapsed.TotalSeconds;
+                    if (partial.Suggestions.Count > 0) _firstSuggestionSeconds ??= _benchmarkWatch.Elapsed.TotalSeconds;
+                }
+                var filtered = partial.Suggestions.Where(s => !_protectedWords.Any(word => s.Original.Contains(word, StringComparison.OrdinalIgnoreCase) && !s.Replacement.Contains(word, StringComparison.OrdinalIgnoreCase))).ToArray();
+                MergeReview(partial.Original, filtered);
+                RenderSession();
+            }
+            SetStatus(p.Message);
+            WorkProgress.IsIndeterminate = !p.Fraction.HasValue;
+            if (p.Fraction.HasValue) WorkProgress.Value = Math.Clamp(p.Fraction.Value * 100, 0, 100);
+        });
+    }
+
+    private void MergeReview(string original, IReadOnlyList<Suggestion> suggestions)
+    {
+        var previous = _session?.Original == original ? _session.Suggestions.ToDictionary(s => (s.Start, s.Length, s.Original, s.Replacement), s => s.Decision) : [];
+        _session = new ReviewSession(original, suggestions);
+        foreach (var suggestion in _session.Suggestions)
+            if (previous.TryGetValue((suggestion.Start, suggestion.Length, suggestion.Original, suggestion.Replacement), out var decision)) suggestion.Decision = decision;
+    }
 
     private void StartWork(string message)
     {
@@ -229,6 +255,7 @@ public partial class MainWindow : Window
     private void InvalidateReview()
     {
         _session = null;
+        _reviewComplete = false;
         SuggestionPanel.Children.Clear(); EmptyPanel.Visibility = Visibility.Visible;
         SuggestionTitle.Text = "수정 제안";
         PreviewEditor.Document = CreateDocument();
@@ -312,16 +339,13 @@ public partial class MainWindow : Window
         {
             if (index >= _session.Suggestions.Count) continue;
             var s = _session.Suggestions[index];
-            var row = new Grid { Margin = new Thickness(0, 9, 0, 9) };
+            var row = new Grid { Margin = new Thickness(0, 14, 0, 14) };
             row.ColumnDefinitions.Add(new ColumnDefinition()); row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var content = new StackPanel { Margin = new Thickness(0, 0, 14, 0) };
-            content.Children.Add(new TextBlock { Text = $"{index + 1}. {s.Category}" + (_step ? $"   ·   {index + 1} / {_session.Suggestions.Count}" : ""), FontSize = 10, Foreground = Brush("#849182"), Margin = new Thickness(0, 0, 0, 5) });
-            var change = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 13 };
-            change.Inlines.Add(new Run(DisplayWhitespace(s.Original)) { Foreground = Brush("#9F6254"), TextDecorations = TextDecorations.Strikethrough });
-            change.Inlines.Add(new Run("  →  ") { Foreground = Brush("#93A18E") });
-            change.Inlines.Add(new Run(DisplayWhitespace(s.Replacement)) { Foreground = Brush("#286346"), FontWeight = FontWeights.SemiBold });
-            content.Children.Add(change);
-            content.Children.Add(new TextBlock { Text = s.Reason, TextWrapping = TextWrapping.Wrap, FontSize = 11, Foreground = Brush("#7B8779"), Margin = new Thickness(0, 5, 0, 0) });
+            content.Children.Add(new TextBlock { Text = $"{index + 1}. {s.Category}" + (_step ? $"   ·   {index + 1} / {_session.Suggestions.Count}" : ""), FontSize = 12, Foreground = Brush("#687E6B"), Margin = new Thickness(0, 0, 0, 8) });
+            content.Children.Add(CorrectionContext(_session.Original, s, false));
+            content.Children.Add(CorrectionContext(_session.Original, s, true));
+            content.Children.Add(new TextBlock { Text = s.Reason, TextWrapping = TextWrapping.Wrap, FontSize = 12, Foreground = Brush("#7B8779"), Margin = new Thickness(0, 7, 0, 0) });
             row.Children.Add(content);
             var actions = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             if (s.Decision == SuggestionDecision.Pending)
@@ -354,7 +378,7 @@ public partial class MainWindow : Window
         int accepted = _session.Suggestions.Count(s => s.Decision == SuggestionDecision.Accepted);
         int pending = _session.Suggestions.Count(s => s.Decision == SuggestionDecision.Pending);
         DecisionStatus.Text = $"선택 {accepted}개 · 남은 제안 {pending}개";
-        PreviewLegend.Text = pending > 0 ? "미검토 제안 포함 · 선택한 수정 사항만 복사·반영돼요" : "검토 완료 · 선택한 수정 사항만 미리보기에 반영됐어요";
+        PreviewLegend.Text = $"선택한 수정 {accepted}개만 반영 · 복사될 글과 같아요";
         UpdateDecisionButtons();
     }
 
@@ -366,7 +390,7 @@ public partial class MainWindow : Window
         foreach (var s in _session.Suggestions)
         {
             if (s.Start > cursor) paragraph.Inlines.Add(new Run(_session.Original[cursor..s.Start]));
-            if (s.Decision == SuggestionDecision.Skipped) paragraph.Inlines.Add(new Run(s.Original));
+            if (s.Decision != SuggestionDecision.Accepted) paragraph.Inlines.Add(new Run(s.Original));
             else if (s.Replacement.Length > 0) paragraph.Inlines.Add(new Run(s.Replacement) { Background = Brush(s.Decision == SuggestionDecision.Accepted ? "#D7ECCC" : "#E8F3E3"), Foreground = Brush("#285D3D"), TextDecorations = TextDecorations.Underline });
             else paragraph.Inlines.Add(new Run("⌫") { Foreground = Brush("#A36F59"), ToolTip = "삭제: " + s.Original });
             cursor = s.Start + s.Length;
@@ -376,6 +400,18 @@ public partial class MainWindow : Window
     }
 
     private static FlowDocument CreateDocument() => new() { PagePadding = new Thickness(3), FontFamily = new FontFamily("Malgun Gothic"), FontSize = 15 };
+    private static TextBlock CorrectionContext(string original, Suggestion suggestion, bool after)
+    {
+        int start = Math.Max(0, suggestion.Start - 65), end = Math.Min(original.Length, suggestion.Start + suggestion.Length + 65);
+        if (start > 0 && char.IsLowSurrogate(original[start])) start--;
+        if (end < original.Length && end > 0 && char.IsHighSurrogate(original[end - 1])) end++;
+        var block = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 15, LineHeight = 23, Margin = new Thickness(0, 3, 0, 3) };
+        block.Inlines.Add(new Run(after ? "수정  " : "원문  ") { FontSize = 11, Foreground = Brush(after ? "#286346" : "#9F6254"), FontWeight = FontWeights.SemiBold });
+        block.Inlines.Add(new Run((start > 0 ? "…" : "") + original[start..suggestion.Start]) { Foreground = Brush("#64746A") });
+        block.Inlines.Add(new Run(DisplayWhitespace(after ? suggestion.Replacement : suggestion.Original)) { Background = Brush(after ? "#DCEEE0" : "#F7E8E3"), Foreground = Brush(after ? "#205C40" : "#934F43"), FontWeight = FontWeights.SemiBold });
+        block.Inlines.Add(new Run(original[(suggestion.Start + suggestion.Length)..end] + (end < original.Length ? "…" : "")) { Foreground = Brush("#64746A") });
+        return block;
+    }
     private static string DisplayWhitespace(string value) => value.Length == 0 ? "(없음)" : string.IsNullOrWhiteSpace(value) ? value.Replace(" ", "␣").Replace("\r", "").Replace("\n", "↵") : value.Replace("\r", "").Replace("\n", " ↵ ");
     private static SolidColorBrush Brush(string hex) => new((Color)System.Windows.Media.ColorConverter.ConvertFromString(hex));
 
@@ -397,7 +433,7 @@ public partial class MainWindow : Window
     private void UpdateViewButtons() { CompareButton.Background = Brush(_step ? "#F7F8F4" : "#E5EEDF"); StepButton.Background = Brush(_step ? "#E5EEDF" : "#F7F8F4"); }
     private void UpdateDecisionButtons()
     {
-        bool has = _session is not null && !_busy;
+        bool has = _session is not null && !_busy && _reviewComplete;
         CopyButton.IsEnabled = has;
         AcceptAllButton.IsEnabled = has && _session!.Suggestions.Any(s => s.Decision == SuggestionDecision.Pending);
         UndoButton.IsEnabled = has && _session!.CanUndo;
@@ -406,13 +442,13 @@ public partial class MainWindow : Window
     }
     private void CopyClick(object sender, RoutedEventArgs e)
     {
-        if (_session is null || _busy) return;
+        if (_session is null || _busy || !_reviewComplete) return;
         try { Clipboard.SetText(_session.BuildAccepted()); SetStatus("선택한 수정 사항을 반영한 글을 복사했어요. 원하는 곳에 붙여넣으세요."); }
         catch { SetStatus("클립보드에 복사하지 못했어요. 잠시 후 다시 시도해 주세요.", true); }
     }
     private async void ApplyClick(object sender, RoutedEventArgs e)
     {
-        if (_session is null || _snapshot?.CanApply != true || _busy) return;
+        if (_session is null || _snapshot?.CanApply != true || _busy || !_reviewComplete) return;
         string replacement = _session.BuildAccepted();
         StartWork("원래 입력칸과 원문을 확인하고 있어요…");
         CancelButton.Visibility = Visibility.Collapsed;
@@ -505,6 +541,10 @@ public partial class MainWindow : Window
         SourceEditor.Text = "자료 확인햇어요. 몇일 전에 보낸 메일을 검토해 주세요.\nI has recieved your email.";
         await ReviewAsync();
         if (_session is null || _session.Suggestions.Count < 2) throw new InvalidOperationException("UI smoke: no expected suggestions.");
+        _reviewComplete = false;
+        UpdateDecisionButtons();
+        if (CopyButton.IsEnabled || ApplyButton.IsEnabled) throw new InvalidOperationException("UI smoke: incomplete review enabled export.");
+        _reviewComplete = true;
         string original = SourceEditor.Text;
         _session.AcceptAll();
         if (_session.BuildAccepted() == original) throw new InvalidOperationException("UI smoke: accept did not change text.");

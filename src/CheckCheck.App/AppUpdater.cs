@@ -113,8 +113,16 @@ internal static class AppUpdater
     }
 
     internal const string InstallScript = """
-        param([Parameter(Mandatory=$true)][string]$Config)
+        param([Parameter(Mandatory=$true)][string]$Config, [switch]$Headless)
         $ErrorActionPreference = 'Stop'
+        # Module search paths can be inherited from PowerShell 7 or another host.
+        # Hash directly with .NET so the Windows PowerShell helper needs no hashing module.
+        function Get-UpdateHash([string]$Path) {
+            $stream = [IO.File]::OpenRead($Path)
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+            finally { $sha.Dispose(); $stream.Dispose() }
+        }
         $update = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
         $target = [IO.Path]::GetFullPath($update.Target)
         $source = [IO.Path]::GetFullPath($update.Source)
@@ -123,11 +131,11 @@ internal static class AppUpdater
         $moved = $false
         try {
             if (-not $target.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase) -or $target -eq $source) { throw 'Invalid update target.' }
-            if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $update.Hash) { throw 'Update checksum mismatch.' }
+            if ((Get-UpdateHash $source) -ne $update.Hash) { throw 'Update checksum mismatch.' }
             $parentProcess = Get-Process -Id $update.Parent -ErrorAction SilentlyContinue
             if ($parentProcess -and -not $parentProcess.WaitForExit(30000)) { throw 'CheckCheck did not exit in time.' }
             Copy-Item -LiteralPath $source -Destination $candidate -Force
-            if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -ne $update.Hash) { throw 'Copied update checksum mismatch.' }
+            if ((Get-UpdateHash $candidate) -ne $update.Hash) { throw 'Copied update checksum mismatch.' }
             Move-Item -LiteralPath $target -Destination $backup -Force
             $moved = $true
             Move-Item -LiteralPath $candidate -Destination $target -Force
@@ -139,8 +147,11 @@ internal static class AppUpdater
                 Copy-Item -LiteralPath $backup -Destination $target -Force
                 Start-Process -FilePath $target -WorkingDirectory ([IO.Path]::GetDirectoryName($target)) -WindowStyle Normal
             }
-            Add-Type -AssemblyName System.Windows.Forms
-            [System.Windows.Forms.MessageBox]::Show("업데이트를 완료하지 못했습니다. 기존 실행 파일을 다시 실행해 주세요.`n" + $failure, '체크체크 업데이트') | Out-Null
+            [IO.File]::WriteAllText($Config + '.error', $failure, [Text.Encoding]::UTF8)
+            if (-not $Headless) {
+                Add-Type -AssemblyName System.Windows.Forms
+                [System.Windows.Forms.MessageBox]::Show("업데이트를 완료하지 못했습니다. 기존 실행 파일을 다시 실행해 주세요.`n" + $failure, '체크체크 업데이트') | Out-Null
+            }
             exit 1
         }
         """;

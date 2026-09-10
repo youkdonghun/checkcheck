@@ -17,6 +17,7 @@ public partial class MainWindow
     internal void EndBackgroundLifecycleCheck() { _preparing = false; FinishWork(); }
     internal async Task RunQuickSmokeAsync(string imagePath)
     {
+        QuickLauncherWindow.RunSmoke(imagePath + ".launcher.png");
         const string validHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         if (AppUpdater.ReadHash(validHash + "  CheckCheck.exe\n") != validHash) throw new InvalidOperationException("Update checksum parsing failed.");
         var releaseJson = System.Text.Json.JsonSerializer.Serialize(new { draft = false, prerelease = false, tag_name = "v99.0.0", assets = new[] {
@@ -31,7 +32,7 @@ public partial class MainWindow
         {
             var quick = new QuickReviewWindow("몇일 전에 보낸 자료를 확인햇어요. I has recieved your email.", null, false,
                 (text, mode, progress, token) => _rules.ReviewAsync(text, mode, progress, token), _native.ApplyAsync, (_, _) => { });
-            quick.Height = temporary ? 480 : 540;
+            if (temporary) { quick.Width = 520; quick.Height = 560; }
             quick.ShowInTaskbar = false; quick.WindowStartupLocation = WindowStartupLocation.Manual; quick.Left = -20000; quick.Top = -20000;
             quick.Show();
             try { await quick.RunSmokeAsync(imagePath + (temporary ? ".popup.png" : ".compact.png")); }
@@ -58,11 +59,11 @@ public partial class MainWindow
 
     private void CompactClick(object sender, RoutedEventArgs e) => OpenQuick(SourceEditor.Text, _snapshot, false);
 
-    private void OpenQuick(string text, CaptureSnapshot? snapshot, bool temporary, int x = 0, int y = 0)
+    private void OpenQuick(string text, CaptureSnapshot? snapshot, bool temporary, int x = 0, int y = 0, ReviewMode? reviewMode = null)
     {
         _quick?.Close();
         _quick = new QuickReviewWindow(text, snapshot, temporary, ReviewQuickAsync, _native.ApplyAsync,
-            (source, capture) => { SetSource(source, capture); BringToFront(); }, temporary ? ReviewMode.Minimal : Mode);
+            (source, capture) => { SetSource(source, capture); BringToFront(); }, reviewMode ?? (temporary ? ReviewMode.Minimal : Mode));
         if (temporary) _quick.PlaceNear(x, y);
         _quick.Show();
         if (!temporary) Hide();
@@ -72,9 +73,10 @@ public partial class MainWindow
     {
         if (_preparing) throw new InvalidOperationException("로컬 AI를 내려받고 있어요. 크게 보기에서 진행률을 확인해 주세요.");
         if (!_local.IsInstalled) throw new InvalidOperationException("로컬 AI 준비가 필요해요. 크게 보기에서 ‘다운로드 시작’을 눌러주세요.");
-        var response = await _local.ReviewAsync(text, mode, progress, token);
         var words = _protectedWords.ToArray();
-        return response with { Suggestions = response.Suggestions.Where(s => !words.Any(w => s.Original.Contains(w, StringComparison.OrdinalIgnoreCase) && !s.Replacement.Contains(w, StringComparison.OrdinalIgnoreCase))).ToArray() };
+        ReviewResult Filter(ReviewResult result) => result with { Suggestions = result.Suggestions.Where(s => !words.Any(w => s.Original.Contains(w, StringComparison.OrdinalIgnoreCase) && !s.Replacement.Contains(w, StringComparison.OrdinalIgnoreCase))).ToArray() };
+        var filteredProgress = new ImmediateProgress<EngineProgress>(p => progress.Report(p.PartialResult is null ? p : p with { PartialResult = Filter(p.PartialResult) }));
+        return Filter(await _local.ReviewAsync(text, mode, filteredProgress, token));
     }
 
     private void ConfigurePopupWatcher()
@@ -90,27 +92,49 @@ public partial class MainWindow
     {
         if (_native.SuspendHotkeyCallbacks || _popupCaptureBusy) return;
         _launcher?.Close();
-        _launcher = new QuickLauncherWindow(selected is not null, async () => await CapturePopupAsync(target, x, y));
+        _launcher = new QuickLauncherWindow(selected is not null, async mode => await CapturePopupAsync(target, x, y, mode), () => OpenClipboardQuick(x, y));
         _launcher.PlaceNear(x, y);
         _launcher.Show();
     }
 
-    private async Task CapturePopupAsync(nint target, int x, int y)
+    private async Task CapturePopupAsync(nint target, int x, int y, ReviewMode mode)
     {
         if (_popupCaptureBusy) return;
         _popupCaptureBusy = true;
+        Task? review = null;
         try
         {
+            OpenQuick("", null, true, x, y, mode);
+            var pendingWindow = _quick!;
+            pendingWindow.SetNotice("선택한 글을 가져오는 중이에요…");
             CaptureSnapshot? capture = null;
             string notice = "선택한 글을 읽지 못했어요. 글을 복사한 뒤 ‘붙여넣기’를 눌러주세요.";
             try { capture = await _native.CaptureFromWindowAsync(target, selectedOnly: true); }
             catch (Exception ex) { notice = ex.Message + " 글을 복사한 뒤 붙여넣기로 검사할 수 있어요."; }
-            OpenQuick(capture?.Text ?? "", capture, true, x, y);
-            if (capture is null) _quick?.SetNotice(notice);
-            _quick?.Activate();
+            if (!pendingWindow.IsVisible || _quick != pendingWindow) return;
+            pendingWindow.Activate();
+            if (capture is null) pendingWindow.SetNotice(notice);
+            else review = pendingWindow.LoadCaptureAsync(capture);
         }
         finally { _popupCaptureBusy = false; }
+        if (review is not null) await review;
     }
+
+    private void OpenClipboardQuick(int x, int y)
+    {
+        string text = "", notice = "복사한 글이 없어요. 글을 복사한 뒤 붙여넣기를 눌러주세요.";
+        try
+        {
+            if (System.Windows.Clipboard.ContainsText()) text = System.Windows.Clipboard.GetText();
+            if (text.Length > 10_000) { text = ""; notice = "한 번에 10,000자까지 검사해요. 글을 나누어 복사해 주세요."; }
+        }
+        catch { notice = "클립보드를 사용할 수 없어요. 잠시 후 붙여넣기를 눌러주세요."; }
+        OpenQuick(text, null, true, x, y);
+        if (text.Length == 0) _quick?.SetNotice(notice);
+        _quick?.Activate();
+    }
+
+    private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T> { public void Report(T value) => report(value); }
 
     private static bool ValidShortcut(uint modifiers, uint key) => modifiers is > 0 and < 16 && (modifiers & 3) != 0 &&
         (key == 0x20 || key is >= 0x30 and <= 0x5A || key is >= 0x70 and <= 0x87);

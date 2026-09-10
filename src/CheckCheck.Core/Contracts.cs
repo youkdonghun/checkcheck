@@ -16,7 +16,7 @@ public sealed class Suggestion
 }
 
 public sealed record ReviewResult(string Original, IReadOnlyList<Suggestion> Suggestions, string Engine, string? Note = null);
-public sealed record EngineProgress(string Message, double? Fraction = null);
+public sealed record EngineProgress(string Message, double? Fraction = null, ReviewResult? PartialResult = null);
 
 public interface IProofreader
 {

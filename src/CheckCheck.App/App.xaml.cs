@@ -10,11 +10,13 @@ public partial class App : Application
     private TrayLifecycle? _tray;
     private SingleInstanceCoordinator? _instance;
     internal static bool IsTestRun { get; private set; }
+    internal static bool IsLiveBenchmark { get; private set; }
     internal void ExitForUpdate() { _tray?.AllowExit(); Shutdown(); }
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
         IsTestRun = e.Args.Length > 0 && e.Args[0].StartsWith("--", StringComparison.Ordinal);
+        IsLiveBenchmark = e.Args.Length >= 3 && e.Args[0] is "--benchmark-file" or "--benchmark-quick-file";
         if (e.Args.Length > 0 && e.Args[0] == "--native-fixture") { NativeSelfTest.RunFixture(); Shutdown(); return; }
         if (e.Args.Length >= 2 && e.Args[0] == "--native-self-test")
         {
@@ -35,6 +37,21 @@ public partial class App : Application
             System.Windows.MessageBox.Show("작업을 완료하지 못했어요. 원문을 확인한 뒤 다시 시도해 주세요.", "체크체크", MessageBoxButton.OK, MessageBoxImage.Information);
         };
         var main = new MainWindow(); MainWindow = main;
+        if (IsLiveBenchmark)
+        {
+            main.ShowInTaskbar = false; main.Left = -20000; main.Top = -20000;
+            main.WindowStartupLocation = WindowStartupLocation.Manual;
+            main.Loaded += async (_, _) =>
+            {
+                try
+                {
+                    if (e.Args[0] == "--benchmark-quick-file") await main.RunQuickArticleBenchmarkAsync(e.Args[1], e.Args[2]);
+                    else await main.RunArticleBenchmarkAsync(e.Args[1], e.Args[2]);
+                    Shutdown(0);
+                }
+                catch (Exception ex) { File.WriteAllText(e.Args[2] + ".error", ex.ToString()); Shutdown(1); }
+            };
+        }
         if (!IsTestRun) _tray = new TrayLifecycle(main, () => Shutdown());
         if (e.Args.Length >= 2 && e.Args[0] == "--lifecycle-self-test")
         {

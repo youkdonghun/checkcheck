@@ -132,4 +132,5 @@ try { await rules.ReviewAsync("teh", ReviewMode.Minimal, null, canceled.Token); 
 catch (OperationCanceledException) { count++; }
 count += await BareunTests.RunAsync();
 count += LocalRuntimeTests.Run();
+count += LocalEditProtocolTests.Run();
 Console.WriteLine($"PASS: {count} checks (diff, Unicode, review decisions, safety, offline rules)");
